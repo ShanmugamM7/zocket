@@ -1,0 +1,154 @@
+---
+- name: Provision Task Tracker host
+  hosts: app
+  become: true
+  gather_facts: true
+
+  vars:
+    image: "{{ image | default('ghcr.io/owner/task-tracker-api:latest') }}"
+    app_port: 3000
+    container_name: task-api
+    registry_url: "{{ registry_url | default('ghcr.io') }}"
+    registry_username: "{{ registry_username | default('') }}"
+    registry_password: "{{ registry_password | default('') }}"
+
+  tasks:
+    # ----- Docker engine -----
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - python3-pip
+        state: present
+        update_cache: true
+
+    - name: Add Docker GPG key
+      ansible.builtin.shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
+        state: present
+
+    - name: Install Docker engine + compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Ensure docker service is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add ubuntu user to docker group
+      ansible.builtin.user:
+        name: ubuntu
+        groups: docker
+        append: true
+
+    # ----- Registry login (optional) -----
+    - name: Login to container registry
+      ansible.builtin.shell: "echo '{{ registry_password }}' | docker login {{ registry_url }} -u '{{ registry_username }}' --password-stdin"
+      when: registry_username != "" and registry_password != ""
+      no_log: true
+      changed_when: false
+
+    # ----- Pull and run the app -----
+    - name: Pull image
+      ansible.builtin.command: "docker pull {{ image }}"
+      register: pull_result
+      changed_when: "'Downloaded newer image' in pull_result.stdout or 'Status: Downloaded' in pull_result.stdout"
+
+    - name: Create persistent data directory
+      ansible.builtin.file:
+        path: /opt/task-api/data
+        state: directory
+        owner: "10001"
+        group: "10001"
+        mode: "0755"
+
+    - name: Render systemd unit for the app container
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/task-api.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Task Tracker API container
+          After=docker.service network-online.target
+          Requires=docker.service
+
+          [Service]
+          Restart=always
+          RestartSec=5
+          ExecStartPre=-/usr/bin/docker rm -f {{ container_name }}
+          ExecStart=/usr/bin/docker run --rm --name {{ container_name }} \
+            -p {{ app_port }}:3000 \
+            -v /opt/task-api/data:/data \
+            -e DATABASE_URL=sqlite:////data/tasks.db \
+            {{ image }}
+          ExecStop=/usr/bin/docker stop {{ container_name }}
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart task-api
+
+    - name: Enable & start task-api
+      ansible.builtin.systemd:
+        name: task-api
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    # ----- Node exporter (host metrics) -----
+    - name: Run node_exporter container
+      ansible.builtin.shell: |
+        docker rm -f node-exporter >/dev/null 2>&1 || true
+        docker run -d --name node-exporter \
+          --restart=always \
+          --pid=host \
+          --network=host \
+          -v "/:/host:ro,rslave" \
+          prom/node-exporter:v1.8.2 \
+          --path.rootfs=/host
+      args:
+        creates: /var/lib/docker/containers/.node-exporter-installed
+      register: node_exporter_run
+
+    - name: Mark node_exporter as installed
+      ansible.builtin.file:
+        path: /var/lib/docker/containers/.node-exporter-installed
+        state: touch
+      when: node_exporter_run.changed
+
+    # ----- Health check -----
+    - name: Wait for app to respond on /healthz
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}/healthz"
+        status_code: 200
+      register: health
+      retries: 20
+      delay: 3
+      until: health.status == 200
+
+  handlers:
+    - name: restart task-api
+      ansible.builtin.systemd:
+        name: task-api
+        daemon_reload: true
+        state: restarted

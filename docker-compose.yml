@@ -1,0 +1,52 @@
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: task-tracker-api:local
+    container_name: task-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - task_data:/data
+    environment:
+      DATABASE_URL: sqlite:////data/tasks.db
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana-provisioning:/etc/grafana/provisioning:ro
+
+volumes:
+  task_data:
+  prom_data:
+  grafana_data:

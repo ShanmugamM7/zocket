@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/crash.log
+terraform/*.tfvars
+!terraform/terraform.tfvars.example
+terraform/generated_id_rsa
+terraform/generated_id_rsa.pub
+
+# Ansible
+ansible/inventory.ini
+ansible/*.retry
+
+# Local data
+data/
+*.db
+
+# OS
+.DS_Store
