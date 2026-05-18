@@ -1,0 +1,6 @@
+[
+  {
+    "targets": ["node-exporter:9100"],
+    "labels": { "host": "ec2-app", "env": "local" }
+  }
+]

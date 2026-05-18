@@ -70,6 +70,43 @@
       ],
       "title": "Host — Memory used",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{app=\"task-api\", status=~\"5.+\"}[1m]))",
+          "legendFormat": "5xx errors/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{app=\"task-api\", status=~\"4.+\"}[1m]))",
+          "legendFormat": "4xx errors/sec",
+          "refId": "B"
+        }
+      ],
+      "title": "Task API — error rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } },
+      "targets": [
+        {
+          "expr": "http_requests_in_progress{app=\"task-api\"}",
+          "legendFormat": "{{handler}} {{method}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Task API — in-flight requests",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

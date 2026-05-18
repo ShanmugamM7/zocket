@@ -12,17 +12,23 @@ services:
       - task_data:/data
     environment:
       DATABASE_URL: sqlite:////data/tasks.db
+    networks:
+      - monitoring
 
   node-exporter:
     image: prom/node-exporter:v1.8.2
     container_name: node-exporter
     restart: unless-stopped
     pid: host
-    network_mode: host
     command:
       - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|run|host/sys|host/proc)($|/)
     volumes:
-      - /:/host:ro,rslave
+      - /:/host:ro
+    ports:
+      - "9100:9100"
+    networks:
+      - monitoring
 
   prometheus:
     image: prom/prometheus:v2.55.0
@@ -32,7 +38,10 @@ services:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/targets:/etc/prometheus/targets:ro
       - prom_data:/prometheus
+    networks:
+      - monitoring
 
   grafana:
     image: grafana/grafana:11.2.0
@@ -45,6 +54,12 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana-provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    driver: bridge
 
 volumes:
   task_data:

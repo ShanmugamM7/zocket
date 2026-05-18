@@ -1,0 +1,6 @@
+[
+  {
+    "targets": ["app:3000"],
+    "labels": { "app": "task-api", "env": "local" }
+  }
+]

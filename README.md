@@ -1,8 +1,9 @@
 # Task Tracker — DevOps Take-Home
 
 A FastAPI Task Tracker service, containerized, provisioned on AWS with Terraform,
-deployed by Ansible, shipped through GitHub Actions, and monitored with
-Prometheus + Grafana + Node Exporter.
+shipped through GitHub Actions to Amazon ECR, and deployed on Amazon ECS (Fargate)
+behind an Application Load Balancer, with DNS managed via Route 53 and monitored
+with Prometheus + Grafana + Node Exporter.
 
 ---
 
@@ -12,30 +13,34 @@ Prometheus + Grafana + Node Exporter.
               ┌─────────────────────────────────────────────────────────────┐
               │                       Developer                              │
               └───────────────┬─────────────────────────────────────────────┘
-                              │ git push main
-                              ▼
-              ┌─────────────────────────────────────────────────────────────┐
-              │  GitHub Actions (.github/workflows/ci-cd.yml)               │
-              │  1. pytest (Docker test stage)                              │
-              │  2. docker build & push  →  GHCR                            │
-              │  3. SSH into EC2  →  pull image  →  systemctl restart       │
-              └───────────────┬─────────────────────────────────────────────┘
                               │
-                              ▼
-   ┌──────────────────────────────────────────────────────────────────────┐
-   │                            AWS (Terraform)                            │
-   │                                                                       │
-   │   ┌──────────────────────────────┐     ┌──────────────────────────┐   │
-   │   │ EC2 t3.micro (Ubuntu 22.04)  │     │ S3 bucket (logs/artifacts)│  │
-   │   │  ├── docker engine            │◀───┤ versioned + SSE + private │  │
-   │   │  ├── task-api  :3000          │     └──────────────────────────┘   │
-   │   │  ├── node_exporter :9100      │     ┌──────────────────────────┐   │
-   │   │  ├── prometheus  :9090*       │     │ Security Group           │   │
-   │   │  └── grafana     :3001*       │◀────┤ 22, 80, 3000, 9090,      │   │
-   │   └──────────────────────────────┘     │ 3001, 9100               │   │
-   │                                          └──────────────────────────┘   │
-   │   * Prometheus + Grafana are optional and brought up via docker-compose │
-   └──────────────────────────────────────────────────────────────────────┘
+                    ┌─────────┴──────────┐
+                    │  git push tag v*   │   git push main
+                    ▼                    ▼
+       ┌────────────────────┐   ┌────────────────────────┐
+       │  ecr-docker-push   │   │    deploy-prod         │
+       │  (build & push     │   │  (workflow_dispatch)   │
+       │   image to ECR)    │   │  updates ECS service   │
+       └────────┬───────────┘   └──────────┬─────────────┘
+                │                          │
+                ▼                          ▼
+       ┌─────────────────┐       ┌─────────────────────┐
+       │  Amazon ECR     │──────▶│  Amazon ECS (Fargate)│
+       │  (Docker image  │       │  Task: zocket        │
+       │   registry)     │       │  Service: zocket-svc │
+       └─────────────────┘       └──────────┬──────────┘
+                                            │
+                                            ▼
+                                 ┌─────────────────────┐
+                                 │  Application Load   │
+                                 │  Balancer (ALB)     │
+                                 └──────────┬──────────┘
+                                            │
+                                            ▼
+                                 ┌─────────────────────┐
+                                 │  Route 53           │
+                                 │  (DNS → ALB)        │
+                                 └─────────────────────┘
 ```
 
 ---
@@ -54,7 +59,9 @@ Prometheus + Grafana + Node Exporter.
 ├── terraform/                 # EC2, SG, S3, IAM, key pair, inventory generator
 ├── ansible/                   # playbook to install docker + run container
 ├── monitoring/                # prometheus.yml + grafana provisioning + dashboard
-└── .github/workflows/ci-cd.yml
+├── .github/workflows/
+│   ├── ecr-docker-push.yml    # triggered on git tag v* → builds & pushes to ECR
+│   └── deploy-prod.yml        # manual trigger → updates ECS task + service
 ```
 
 ---
@@ -62,11 +69,10 @@ Prometheus + Grafana + Node Exporter.
 ## Prerequisites
 
 - Docker Desktop (or any Docker engine) — used for local runs, building, and tests.
-- AWS account + credentials available to Terraform (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or `aws configure`).
-- A GitHub repository fork to drive CI/CD.
-
-You **do not** need Terraform, Ansible, Python, or pytest installed on the host —
-everything runs through containers.
+- AWS account + credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+- Amazon ECR repository created.
+- Amazon ECS cluster + service + task definition created.
+- Application Load Balancer wired to the ECS target group.
 
 ---
 
@@ -103,9 +109,7 @@ docker build --target test -t task-tracker-api:test .
 ```bash
 cd terraform
 cp terraform.tfvars.example terraform.tfvars
-# Edit ssh_allowed_cidr to your IP, set public_key_path if you have a key.
 
-# Terraform via Docker (no local install needed):
 alias tf='docker run --rm -it -v "$PWD:/tf" -w /tf \
     -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
     -e AWS_REGION hashicorp/terraform:1.9'
@@ -115,143 +119,122 @@ tf plan -out tfplan
 tf apply tfplan
 ```
 
-Outputs:
+---
 
-| Output        | Purpose                                       |
-| ------------- | --------------------------------------------- |
-| `public_ip`   | EC2 public IP                                 |
-| `public_dns`  | EC2 public DNS                                |
-| `bucket_name` | S3 artifacts/logs bucket                      |
-| `app_url`     | Base URL of the deployed app                  |
-| `ssh_command` | Ready-to-paste `ssh -i ... ubuntu@...`        |
+## 3. CI/CD
 
-Terraform also writes `ansible/inventory.ini` automatically.
+### Workflow 1 — Build & Push to ECR (`ecr-docker-push.yml`)
 
-If `public_key_path` was empty, Terraform generates `terraform/generated_id_rsa`
-(mode 0600) for you to SSH with.
+Triggered on any tag matching `v*` (e.g. `git tag v1.0.0 && git push origin v1.0.0`):
+
+1. Checks out code
+2. Extracts image tag from the Git tag
+3. Authenticates with AWS + logs into ECR
+4. Builds Docker image, tags as `<version>` and `latest`, pushes both to ECR
+
+### Workflow 2 — Deploy to ECS (`deploy-prod.yml`)
+
+Triggered manually via `workflow_dispatch` (Actions → Deploy Zocket to PROD → Run workflow):
+
+1. Fetches current ECS task definition
+2. Updates the container image to the specified version
+3. Registers a new task definition revision
+4. Updates the ECS service with `--force-new-deployment`
+5. Waits for the service to stabilise
+
+### Required GitHub Secrets
+
+| Secret                  | Value                                  |
+| ----------------------- | -------------------------------------- |
+| `AWS_ACCESS_KEY_ID`     | IAM user access key                    |
+| `AWS_SECRET_ACCESS_KEY` | IAM user secret key                    |
+| `AWS_REGION`            | e.g. `ap-south-1`                      |
+| `ECR_REGISTRY`          | e.g. `123456789.dkr.ecr.ap-south-1.amazonaws.com` |
+| `ECR_REPOSITORY`        | ECR repository name                    |
+| `ECS_CLUSTER`           | ECS cluster name                       |
+| `ECS_SERVICE`           | ECS service name                       |
+| `ECS_TASK`              | ECS task definition family name        |
 
 ---
 
-## 3. Deploy the app (Ansible)
+## 4. API reference
+
+Base URL: `http://zocket-alb-690003003.ap-south-1.elb.amazonaws.com`
+
+| Method | Path       | Body                                                                        | Notes               |
+| ------ | ---------- | --------------------------------------------------------------------------- | ------------------- |
+| `POST` | `/tasks`   | `{"title": "...", "description": "...", "status": "pending\|in_progress\|done"}` | 201 returns the row |
+| `GET`  | `/tasks`   | —                                                                           | newest first        |
+| `GET`  | `/healthz` | —                                                                           | liveness probe      |
+| `GET`  | `/metrics` | —                                                                           | Prometheus metrics  |
+
+### Smoke tests
 
 ```bash
-# From the project root:
-docker run --rm -it \
-  -v "$PWD/ansible:/work" \
-  -v "$PWD/terraform/generated_id_rsa:/work/key:ro" \
-  -w /work cytopia/ansible:latest \
-  ansible-playbook -i inventory.ini playbook.yml \
-    -e image=ghcr.io/<owner>/<repo>:latest \
-    -e registry_username=<gh-user> \
-    -e registry_password=<gh-token>
-```
+ALB=http://zocket-alb-690003003.ap-south-1.elb.amazonaws.com
 
-The playbook:
+# Health check
+curl $ALB/healthz
 
-1. Installs Docker CE + the compose plugin
-2. (Optional) Logs into GHCR / Docker Hub
-3. Pulls the image
-4. Writes a `task-api.service` systemd unit (auto-restart on failure)
-5. Starts the container on port `3000`
-6. Runs `node_exporter` on `:9100`
-7. Polls `/healthz` until the app is up
-
----
-
-## 4. CI/CD
-
-The workflow at [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
-runs on every push to `main`:
-
-1. **test** — builds the Docker `test` stage (pytest)
-2. **build-and-push** — builds the `runtime` image, tags `:<sha>` + `:latest`, pushes to GHCR
-3. **deploy** — SSHes into EC2, pulls the new image, rewrites the systemd unit, and restarts (zero-downtime restart since systemd replaces the container in <1s and `/healthz` is polled)
-
-Required GitHub Secrets:
-
-| Secret         | Value                                              |
-| -------------- | -------------------------------------------------- |
-| `EC2_HOST`     | Terraform output `public_ip`                       |
-| `EC2_USER`     | `ubuntu`                                           |
-| `EC2_SSH_KEY` | Contents of `terraform/generated_id_rsa`           |
-
-GHCR auth uses the workflow's built-in `GITHUB_TOKEN` (no manual setup needed).
-
----
-
-## 5. API reference
-
-| Method | Path        | Body                                                | Notes                |
-| ------ | ----------- | --------------------------------------------------- | -------------------- |
-| `POST` | `/tasks`    | `{"title": "...", "description": "...", "status": "pending\|in_progress\|done"}` | 201 returns the row  |
-| `GET`  | `/tasks`    | —                                                   | newest first         |
-| `GET`  | `/healthz`  | —                                                   | liveness probe       |
-| `GET`  | `/metrics`  | —                                                   | Prometheus exposition |
-
-Smoke test against a deployed host:
-
-```bash
-HOST=$(cd terraform && tf output -raw public_ip)
-curl -s http://$HOST:3000/healthz
-curl -s -X POST http://$HOST:3000/tasks \
+# Create a task
+curl -X POST $ALB/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"title":"first","status":"pending"}'
-curl -s http://$HOST:3000/tasks
+  -d '{"title":"first","description":"test","status":"pending"}'
+
+# List all tasks
+curl $ALB/tasks
 ```
 
 ---
 
-## 6. Monitoring
+## 5. Monitoring
 
 - **App metrics** — `prometheus-fastapi-instrumentator` exposes `/metrics` on the app itself.
-- **Host metrics** — Node Exporter on `:9100` (installed by Ansible).
+- **Host metrics** — Node Exporter on `:9100`.
 - **Prometheus + Grafana** — run the optional containers in `docker-compose.yml`. The Grafana dashboard `Task Tracker` is auto-provisioned with RPS, p95 latency, CPU%, and memory panels.
 
-To run the monitoring stack *on the EC2 host* (in addition to what the playbook installs):
-
 ```bash
-ssh -i terraform/generated_id_rsa ubuntu@$HOST
-git clone <repo> && cd <repo>
 docker compose up -d prometheus grafana
+# Grafana → http://localhost:3001  (admin / admin)
+# Prometheus → http://localhost:9090
 ```
-
-Then open `http://<public_ip>:3001` (Grafana, `admin`/`admin`) and `http://<public_ip>:9090` (Prometheus). Both ports are open only to `ssh_allowed_cidr`.
 
 ---
 
-## 7. Tear down
+## 6. Tear down
 
 ```bash
 cd terraform && tf destroy
 ```
 
-This deletes the EC2 instance, security group, IAM role, key pair, and S3 bucket
-(`force_destroy = true`).
-
 ---
 
 ## Design decisions
 
-| Decision                              | Why                                                                 |
-| ------------------------------------- | ------------------------------------------------------------------- |
-| **FastAPI**                           | Tiny surface, async-ready, has a Prometheus instrumentor on a shelf |
-| **SQLite on a Docker volume**         | Zero extra infra; assignment says SQLite *or* Postgres              |
-| **Multi-stage Dockerfile w/ test stage** | The CI test job is `docker build --target test` — same exact env as runtime |
-| **GHCR (not Docker Hub)**             | Free, repo-scoped, no extra credential setup beyond `GITHUB_TOKEN` |
-| **systemd unit instead of `docker run`** | Survives reboots, restarts on crash → satisfies the "self-healing" bonus |
-| **Generated SSH key as a fallback**   | Lowers friction for evaluators — they don't need to wire up keys    |
-| **Terraform writes the Ansible inventory** | No manual copy/paste between IaC and config-management              |
-| **`docker compose` for the monitoring stack** | Keeps it optional and trivially reproducible locally and on the EC2 |
+| Decision                                    | Why                                                                         |
+| ------------------------------------------- | --------------------------------------------------------------------------- |
+| **FastAPI**                                 | Tiny surface, async-ready, has a Prometheus instrumentor on a shelf         |
+| **SQLite on a Docker volume**               | Zero extra infra; assignment says SQLite *or* Postgres                      |
+| **Multi-stage Dockerfile w/ test stage**    | The CI test job is `docker build --target test` — same exact env as runtime |
+| **Amazon ECR**                              | Native AWS registry, no extra credentials beyond IAM                        |
+| **Amazon ECS (Fargate)**                    | Serverless container hosting — no EC2 instances to manage                   |
+| **ALB in front of ECS**                     | Health checks, rolling deployments, host-based routing                      |
+| **Route 53 CNAME → ALB**                   | Clean DNS routing without hardcoding IPs                                    |
+| **Tag-triggered ECR push**                  | Decouples image build from deployment; every tag is an immutable artifact    |
+| **`workflow_dispatch` deploy**              | Explicit, auditable production deploys with version selection               |
+| **`docker compose` for monitoring stack**   | Keeps it optional and trivially reproducible locally                        |
 
 ## Challenges / trade-offs
 
-- **Truly zero-downtime on a single node** would need a second container on a different port + nginx swap. The current `systemctl restart` swap is ~1 second; sufficient for the assignment but called out honestly.
-- **State** — SQLite means the container can move but the host cannot. For production I'd switch to RDS + remove the volume.
-- **TLS** — port 80 is open but nothing terminates HTTPS. Easiest next step: Caddy as a reverse proxy with Let's Encrypt.
+- **State** — SQLite means data lives in the container's ephemeral volume. For production, switch to RDS and remove the volume mount.
+- **TLS** — ALB listens on port 80. Next step: attach an ACM certificate and add an HTTPS listener.
 - **Remote Terraform state** — kept local for simplicity; an S3 backend block is one paragraph away.
+- **Public DNS** — Route 53 hosted zone is configured; public resolution requires registering the domain and delegating nameservers.
 
 ## Bonus checklist
 
-- [x] Zero-downtime *enough* deploy (systemd restart + health poll)
-- [x] Self-healing (`Restart=always` in systemd, `--restart=always` on monitoring containers)
-- [ ] ECS/Fargate (skipped to keep the footprint single-EC2 per the brief)
+- [x] Zero-downtime deploy (ECS rolling update + ALB health checks)
+- [x] Self-healing (ECS restarts failed tasks automatically)
+- [x] ECS/Fargate deployment
+- [x] Container registry (Amazon ECR)
+- [x] DNS routing (Route 53 → ALB)
