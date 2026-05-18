@@ -1,9 +1,16 @@
 provider "aws" {
-  region = var.aws_region
+  region  = var.aws_region
+  profile = var.aws_profile
 }
 
 locals {
-  name = var.project
+  name           = var.project
+  container_name = "${var.project}-api"
+  use_https      = var.certificate_arn != ""
+
+  # Falls back to ECR repo:latest when no explicit image is provided
+  image = var.container_image != "" ? var.container_image : "${aws_ecr_repository.this.repository_url}:latest"
+
   common_tags = merge(
     {
       Project   = var.project
@@ -14,7 +21,7 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# Networking — use the default VPC for simplicity
+# Networking — default VPC (mirrors rozana-oms pattern)
 # ---------------------------------------------------------------------------
 data "aws_vpc" "default" {
   default = true
@@ -28,55 +35,86 @@ data "aws_subnets" "default" {
 }
 
 # ---------------------------------------------------------------------------
-# AMI — latest Ubuntu 22.04 (Jammy) from Canonical
+# ECR
 # ---------------------------------------------------------------------------
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
+resource "aws_ecr_repository" "this" {
+  name                 = local.name
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
 
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_ecr_lifecycle_policy" "this" {
+  repository = aws_ecr_repository.this.name
+
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep last 10 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# CloudWatch log group
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "ecs" {
+  name              = "/ecs/${local.name}"
+  retention_in_days = 30
+  tags              = local.common_tags
+}
+
+# ---------------------------------------------------------------------------
+# IAM — ECS execution role (pull images, write logs)
+# ---------------------------------------------------------------------------
+data "aws_iam_policy_document" "ecs_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
   }
 }
 
-# ---------------------------------------------------------------------------
-# SSH key — reuse user-provided key, otherwise generate one
-# ---------------------------------------------------------------------------
-resource "tls_private_key" "generated" {
-  count     = var.public_key_path == "" ? 1 : 0
-  algorithm = "RSA"
-  rsa_bits  = 4096
+resource "aws_iam_role" "ecs_execution" {
+  name               = "${local.name}-ecs-execution-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+  tags               = local.common_tags
 }
 
-resource "local_sensitive_file" "private_key" {
-  count           = var.public_key_path == "" ? 1 : 0
-  content         = tls_private_key.generated[0].private_key_pem
-  filename        = "${path.module}/generated_id_rsa"
-  file_permission = "0600"
+resource "aws_iam_role_policy_attachment" "ecs_execution" {
+  role       = aws_iam_role.ecs_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-resource "aws_key_pair" "this" {
-  key_name   = "${local.name}-key"
-  public_key = var.public_key_path == "" ? tls_private_key.generated[0].public_key_openssh : file(var.public_key_path)
-  tags       = local.common_tags
+# Task role — separate from execution role; extend with inline policies as needed
+resource "aws_iam_role" "ecs_task" {
+  name               = "${local.name}-ecs-task-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+  tags               = local.common_tags
 }
 
 # ---------------------------------------------------------------------------
-# Security group
+# Security Groups (mirrors rozana-oms-prod: separate ALB SG + ECS task SG)
 # ---------------------------------------------------------------------------
-resource "aws_security_group" "app" {
-  name        = "${local.name}-sg"
-  description = "Task Tracker — SSH, HTTP, app, and monitoring"
+
+# ALB SG — allows inbound 80 from internet (+ 443 when HTTPS enabled)
+resource "aws_security_group" "alb" {
+  name        = "${local.name}-alb-sg"
+  description = "${local.name} load balancer"
   vpc_id      = data.aws_vpc.default.id
-
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.ssh_allowed_cidr]
-  }
 
   ingress {
     description = "HTTP"
@@ -86,169 +124,256 @@ resource "aws_security_group" "app" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    description = "App"
-    from_port   = var.app_port
-    to_port     = var.app_port
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "Prometheus UI"
-    from_port   = 9090
-    to_port     = 9090
-    protocol    = "tcp"
-    cidr_blocks = [var.ssh_allowed_cidr]
-  }
-
-  ingress {
-    description = "Grafana UI"
-    from_port   = 3001
-    to_port     = 3001
-    protocol    = "tcp"
-    cidr_blocks = [var.ssh_allowed_cidr]
-  }
-
-  ingress {
-    description = "Node exporter"
-    from_port   = 9100
-    to_port     = 9100
-    protocol    = "tcp"
-    cidr_blocks = [var.ssh_allowed_cidr]
+  dynamic "ingress" {
+    for_each = local.use_https ? [1] : []
+    content {
+      description = "HTTPS"
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
   }
 
   egress {
-    description = "Egress all"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  tags = merge(local.common_tags, { Name = "${local.name}-alb-sg" })
+}
+
+# ECS task SG — only allows traffic from the ALB SG and self
+resource "aws_security_group" "ecs_tasks" {
+  name        = "${local.name}-ecs-tasks-sg"
+  description = "${local.name} ECS tasks"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description     = "allow from ALB"
+    from_port       = var.app_port
+    to_port         = var.app_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  ingress {
+    description = "self access"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, { Name = "${local.name}-ecs-tasks-sg" })
+}
+
+# ---------------------------------------------------------------------------
+# Application Load Balancer
+# ---------------------------------------------------------------------------
+resource "aws_lb" "this" {
+  name               = "${local.name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = data.aws_subnets.default.ids
+
+  enable_deletion_protection = false
+
   tags = local.common_tags
 }
 
 # ---------------------------------------------------------------------------
-# S3 bucket for logs/artifacts
+# Target Group (ip type for Fargate awsvpc, matches rozana-oms pattern)
 # ---------------------------------------------------------------------------
-resource "random_id" "bucket_suffix" {
-  byte_length = 4
+resource "aws_lb_target_group" "this" {
+  name        = "${local.name}-tg"
+  port        = var.app_port
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
+  target_type = "ip"
+
+  health_check {
+    enabled             = true
+    path                = var.health_check_path
+    protocol            = "HTTP"
+    port                = "traffic-port"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 5
+    unhealthy_threshold = 2
+    matcher             = "200"
+  }
+
+  tags = local.common_tags
 }
 
-resource "aws_s3_bucket" "artifacts" {
-  bucket        = "${local.name}-${random_id.bucket_suffix.hex}"
-  force_destroy = true
-  tags          = local.common_tags
-}
+# ---------------------------------------------------------------------------
+# Listeners
+# HTTP → forward to TG (no cert), or HTTP → 301 redirect to HTTPS (with cert)
+# ---------------------------------------------------------------------------
+resource "aws_lb_listener" "http" {
+  count             = local.use_https ? 0 : 1
+  load_balancer_arn = aws_lb.this.arn
+  port              = 80
+  protocol          = "HTTP"
 
-resource "aws_s3_bucket_versioning" "artifacts" {
-  bucket = aws_s3_bucket.artifacts.id
-  versioning_configuration {
-    status = "Enabled"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.this.arn
   }
 }
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
-  bucket = aws_s3_bucket.artifacts.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+resource "aws_lb_listener" "http_redirect" {
+  count             = local.use_https ? 1 : 0
+  load_balancer_arn = aws_lb.this.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
     }
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "artifacts" {
-  bucket                  = aws_s3_bucket.artifacts.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+resource "aws_lb_listener" "https" {
+  count             = local.use_https ? 1 : 0
+  load_balancer_arn = aws_lb.this.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = var.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.this.arn
+  }
 }
 
 # ---------------------------------------------------------------------------
-# IAM — let the EC2 instance write to the bucket
+# ECS Cluster
 # ---------------------------------------------------------------------------
-data "aws_iam_policy_document" "ec2_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
+resource "aws_ecs_cluster" "this" {
+  name = "${local.name}-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_ecs_cluster_capacity_providers" "this" {
+  cluster_name       = aws_ecs_cluster.this.name
+  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
+
+  default_capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 1
+    base              = 0
+  }
+}
+
+# ---------------------------------------------------------------------------
+# ECS Task Definition
+# ---------------------------------------------------------------------------
+resource "aws_ecs_task_definition" "this" {
+  family                   = local.name
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = tostring(var.task_cpu)
+  memory                   = tostring(var.task_memory)
+  execution_role_arn       = aws_iam_role.ecs_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = local.container_name
+      image     = local.image
+      essential = true
+
+      portMappings = [
+        {
+          containerPort = var.app_port
+          hostPort      = var.app_port
+          protocol      = "tcp"
+          name          = "${local.container_name}-port"
+          appProtocol   = "http"
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "ecs"
+          "awslogs-create-group"  = "true"
+        }
+      }
+
+      environment = []
+      secrets     = []
     }
-  }
-}
+  ])
 
-resource "aws_iam_role" "ec2" {
-  name               = "${local.name}-ec2-role"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
-  tags               = local.common_tags
-}
-
-data "aws_iam_policy_document" "s3_rw" {
-  statement {
-    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
-    resources = [aws_s3_bucket.artifacts.arn]
-  }
-  statement {
-    actions   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
-    resources = ["${aws_s3_bucket.artifacts.arn}/*"]
-  }
-}
-
-resource "aws_iam_role_policy" "s3_rw" {
-  name   = "${local.name}-s3-rw"
-  role   = aws_iam_role.ec2.id
-  policy = data.aws_iam_policy_document.s3_rw.json
-}
-
-resource "aws_iam_instance_profile" "ec2" {
-  name = "${local.name}-instance-profile"
-  role = aws_iam_role.ec2.name
+  tags = local.common_tags
 }
 
 # ---------------------------------------------------------------------------
-# EC2 instance
+# ECS Service
 # ---------------------------------------------------------------------------
-resource "aws_instance" "app" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
-  subnet_id                   = data.aws_subnets.default.ids[0]
-  vpc_security_group_ids      = [aws_security_group.app.id]
-  key_name                    = aws_key_pair.this.key_name
-  iam_instance_profile        = aws_iam_instance_profile.ec2.name
-  associate_public_ip_address = true
+resource "aws_ecs_service" "this" {
+  name                              = "${local.name}-service"
+  cluster                           = aws_ecs_cluster.this.arn
+  task_definition                   = aws_ecs_task_definition.this.arn
+  desired_count                     = var.desired_count
+  launch_type                       = "FARGATE"
+  platform_version                  = "1.4.0"
+  health_check_grace_period_seconds = 60
+  enable_execute_command            = true
 
-  root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
-    encrypted   = true
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = true
   }
 
-  user_data = <<-EOF
-              #!/bin/bash
-              set -euxo pipefail
-              apt-get update -y
-              apt-get install -y python3 ca-certificates curl
-              EOF
+  load_balancer {
+    target_group_arn = aws_lb_target_group.this.arn
+    container_name   = local.container_name
+    container_port   = var.app_port
+  }
 
-  tags = merge(local.common_tags, {
-    Name = "${local.name}-ec2"
-  })
-}
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
-# ---------------------------------------------------------------------------
-# Generate an Ansible inventory file pointing at the new host
-# ---------------------------------------------------------------------------
-resource "local_file" "ansible_inventory" {
-  filename        = "${path.module}/../ansible/inventory.ini"
-  file_permission = "0644"
-  content         = <<-EOT
-    [app]
-    ${aws_instance.app.public_ip} ansible_user=ubuntu ansible_ssh_private_key_file=${var.public_key_path == "" ? abspath("${path.module}/generated_id_rsa") : abspath(replace(var.public_key_path, ".pub", ""))}
+  deployment_controller {
+    type = "ECS"
+  }
 
-    [app:vars]
-    artifacts_bucket=${aws_s3_bucket.artifacts.bucket}
-    aws_region=${var.aws_region}
-  EOT
+  depends_on = [
+    aws_lb_listener.http,
+    aws_lb_listener.http_redirect,
+    aws_lb_listener.https,
+    aws_iam_role_policy_attachment.ecs_execution,
+  ]
+
+  tags = local.common_tags
 }
