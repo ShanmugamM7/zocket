@@ -13,13 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      ECS_API_CLUSTER: ${{ vars.ECS_CLUSTER }}
-      ECS_API_SERVICE: ${{ vars.ECS_SERVICE }}
-      ECS_API_TASK: ${{ vars.ECS_TASK }}
-      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECS_API_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      ECS_API_SERVICE: ${{ secrets.ECS_SERVICE }}
+      ECS_API_TASK: ${{ secrets.ECS_TASK }}
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
       ECR_IMAGE_TAG: ${{ github.event.inputs.version }}
-      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
 
     steps:
       - name: Checkout code
